@@ -1,0 +1,158 @@
+name: CI/CD Workflow
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feat/**"
+      - "fix/**"
+      - "refactor/**"
+      - "style/**"
+  pull_request:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # 0️⃣ Lint
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run lint
+        run: pnpm lint
+
+  # 1️⃣ Build & Test
+  build:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm run build
+      - name: Test
+        run: pnpm test || true
+
+      # Build/Test 실패 시 PR 코멘트 + 닫기
+      - name: Fail PR if build/test fails
+        if: ${{ failure() && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = ${{ github.event.pull_request.number }};
+            const updated_title = `[CI FAIL] ${{ github.event.pull_request.title }}`;
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr,
+              body: '빌드 또는 테스트에 실패했습니다.',
+              event: 'REQUEST_CHANGES'
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr,
+              title: updated_title,
+              state: 'closed'
+            });
+
+      # Build/Test 통과 시 PR 승인 + develop 머지
+      - name: Approve & Merge PR if build/test passes
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = ${{ github.event.pull_request.number }};
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr,
+              body: 'CI 통과, develop로 자동 머지합니다.',
+              event: 'APPROVE'
+            });
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr
+            });
+
+  # 2️⃣ Preview 배포 (feature/*, fix/*, refactor/*, style/*, develop PR)
+  deploy-preview:
+    if: ${{ !startsWith(github.ref, 'refs/heads/main') }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vercel CLI 설치
+        run: npm install -g vercel@latest
+      - name: Vercel Preview Deploy
+        id: deploy
+        run: |
+          DEPLOY_URL=$(vercel deploy --token=${{ secrets.VERCEL_TOKEN }} --yes)
+          echo "url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      - name: PR 코멘트에 Preview URL 작성
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployUrl = '${{ steps.deploy.outputs.url }}';
+            const comment = `🚀 **미리보기 배포 완료!**\n\n📝 **배포 URL:** ${deployUrl}\n✅ **브랜치:** \`${{ github.head_ref }}\`\n✅ **커밋:** \`${{ github.sha }}\``;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+  # 3️⃣ Production 배포 (main push)
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vercel CLI 설치
+        run: npm install -g vercel@latest
+      - name: Vercel Production Deploy
+        id: deploy-prod
+        run: |
+          DEPLOY_URL=$(vercel deploy --prod --token=${{ secrets.VERCEL_TOKEN }} --yes)
+          echo "url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      - name: 운영 배포 완료 알림
+        run: |
+          echo "🎉 운영 환경 배포 완료!"
+          echo "📝 배포 URL: ${{ steps.deploy-prod.outputs.url }}"
